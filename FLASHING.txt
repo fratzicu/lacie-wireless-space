@@ -1,0 +1,167 @@
+LaCie Wireless Space - flashing, recovery and boot menu
+========================================================
+
+The box runs a mainline U-Boot port (2026.10, board "wireless_space") in
+NAND block 0 and OpenWrt (squashfs + UBIFS overlay) in UBI. The stock LaCie
+firmware is gone. There is no RedBoot on this box: the boot loader is U-Boot,
+with its own boot menu and web recovery (below).
+
+NAND layout
+  0x000000  768 KiB  u-boot      (BootROM reads it with Marvell RS ECC)
+  0x0c0000  256 KiB  u-boot-env  (2 copies, fw_printenv/fw_setenv in OpenWrt)
+  0x100000  127 MiB  ubi         (volumes kernel, rootfs, rootfs_data)
+
+Addresses (U-Boot defaults, change with setenv + saveenv)
+  box (ipaddr)       192.168.1.1
+  PC (serverip)      192.168.1.2   TFTP/HTTP server for the images
+  serial console     115200 8N1, 3.3 V TTL
+
+Image files (in this folder)
+  ...-squashfs-sysupgrade.bin   update from a running OpenWrt
+  ...-squashfs-factory.bin      write from U-Boot (web, TFTP, USB, HTTP)
+  ...-initramfs-uImage          OpenWrt in RAM only, nothing is written
+
+
+1. NORMAL UPDATE (OpenWrt running)
+----------------------------------
+LuCI: System > Backup / Flash Firmware > Flash image..., choose the
+sysupgrade.bin, keep "Keep settings" ticked.
+
+Command line (SSH or serial):
+    scp ...-squashfs-sysupgrade.bin root@192.168.1.1:/tmp/fw.bin
+    (or on the box: wget -O /tmp/fw.bin http://<pc>:<port>/...sysupgrade.bin)
+    sysupgrade -T /tmp/fw.bin        # check only
+    sysupgrade -v /tmp/fw.bin        # flash, keep settings
+    sysupgrade -n -v /tmp/fw.bin     # flash, reset to defaults
+
+Front light during the update: green blinking, then blue/green/red
+blinking while writing; it reboots straight away (no red, reboot -f),
+then blue fast/slow blinking while booting and blue steady when ready.
+
+Settings that are kept: /etc/config, passwords, /etc/ksmbd, everything in
+/etc/sysupgrade.conf. Files changed elsewhere (e.g. /usr/sbin) are replaced
+by the image.
+
+
+2. BUTTONS AND LIGHT
+--------------------
+Rear button
+  held at power-on (until the light/boot starts)  U-Boot web recovery (3.)
+  pressed during the fast blue blinking at boot    OpenWrt failsafe
+                                                   (red blinking; ssh root@
+                                                   192.168.1.1, no password;
+                                                   then e.g. firstboot or
+                                                   mount_root to repair)
+  short press (< 1 s) while running                reboot
+  held 5 s while running                           red blinking, factory reset
+                                                   on release (all settings
+                                                   lost)
+Front touch area (WPS, GPIO43)
+  while touching          blue/green fast blinking
+  short touch (< 3 s)     WPS pairing for 2 min, blue/green slow blinking
+  held 3 s or more        Wi-Fi on/off (saved); after 3 s the light shows
+                          the new state: green = off, blue = on
+Light (stock manual 1.8): blue = ready, Wi-Fi on; green = ready, Wi-Fi off;
+other colour flickers on disk access; red = no disk or shutting down.
+
+
+3. WEB RECOVERY (U-Boot)
+------------------------
+Start it by holding the rear button while powering on, or with boot menu
+entry "Web recovery", or automatically after 3 failed boots (bootcount) or
+when no system boots at all.
+  - PC on the LAN with an address in 192.168.1.x (e.g. .2)
+  - browse to http://192.168.1.1/
+  - upload the factory.bin: it is written to the ubi partition and the box
+    reboots. An initramfs-uImage uploaded there is booted from RAM instead
+    (nothing written). U-Boot images are refused.
+  - Ctrl-C on the serial console leaves recovery.
+
+
+4. BOOT MENU (serial console, 3 s)
+----------------------------------
+Connect the serial console (115200 8N1) and press a key/arrow within 3 s of
+power-on. Entry 0 runs when nothing is pressed.
+   0 Boot OpenWrt (NAND, then USB, then disk)  normal boot
+   1 Boot from USB stick (/boot/uImage)        FAT stick, file /boot/uImage
+   2 Boot from internal disk (/boot/uImage)    sda1, file /boot/uImage
+   3 Boot initramfs from TFTP server           <serverip>:initramfs_file
+   4 Boot initramfs from HTTP URL              ${http_url}
+   5 Network boot (DHCP + PXE)
+   6 Web recovery                              see 3.
+   7 Flash firmware from TFTP server           <serverip>:factory_file
+   8 Flash firmware from USB stick             FAT stick, factory_file in /
+   9 Flash firmware from HTTP URL              ${http_url} (see 6.)
+  10 Backup whole NAND to USB stick            FAT stick, 140 MB free
+  11 Restore default U-Boot settings
+
+Useful U-Boot variables (printenv / setenv / saveenv):
+  ipaddr, serverip, netmask
+  initramfs_file = openwrt-kirkwood-generic-lacie_wireless-space-initramfs-uImage
+  factory_file   = openwrt-kirkwood-generic-lacie_wireless-space-squashfs-factory.bin
+  http_url       = http://192.168.1.2/<initramfs_file>
+  bootlimit = 3, bootmenu_delay = 3
+
+
+5. FLASH OR BOOT VIA TFTP
+-------------------------
+On the PC (192.168.1.2):
+  - run a TFTP server whose root holds the factory.bin and/or the
+    initramfs-uImage with the names above, e.g.
+        sudo dnsmasq --no-daemon --port=0 --enable-tftp --tftp-root=$PWD
+    or tftpd-hpa / atftpd; allow UDP 69 (and the data ports) in the
+    firewall for 192.168.1.1
+  - on the box: boot menu 7 (flash) or 3 (RAM boot), or by hand:
+        tftpboot ${loadaddr} ${factory_file}
+        imgtype ${loadaddr} ${filesize}
+        run recovery_apply
+    (recovery_apply writes a factory image, boots a uImage, refuses kwb)
+  - safest route when unsure: menu 3 (initramfs in RAM), then in that
+    OpenWrt: sysupgrade -n /tmp/...sysupgrade.bin
+
+
+6. FLASH OR BOOT VIA HTTP
+-------------------------
+On the PC: serve the folder, e.g.
+        python3 -m http.server 80        (port 80: http_url has no port)
+  and allow TCP 80 from 192.168.1.1.
+  http_url points to the initramfs by default, so menu 4 and menu 9 boot it
+  from RAM. To flash over HTTP, point it to the factory image first:
+        setenv http_url http://192.168.1.2/openwrt-kirkwood-generic-lacie_wireless-space-squashfs-factory.bin
+        run flash_http
+  (saveenv only if it should stay that way)
+
+
+7. FLASH VIA USB STICK
+----------------------
+FAT32 stick, factory.bin in the root with the exact factory_file name, in
+the front USB port. Boot menu 8, or: run flash_usb.
+Menu 1 boots /boot/uImage from the same stick (e.g. a renamed
+initramfs-uImage) without writing anything.
+
+
+8. U-BOOT BROKEN: UART BOOT (kwboot)
+------------------------------------
+The BootROM can load U-Boot over the serial line. Power the box off for
+15-20 s (kwboot only catches the BootROM on a real power-on), then:
+    kwboot -t -b u-boot-2026.10-wireless-space.kwb /dev/ttyUSBx
+(the kwboot from the patched U-Boot tree, tools/kwboot). In that RAM U-Boot
+rewrite block 0 with the pre-encoded image (RS ECC, see NOTES.txt):
+    nand erase 0x0 0x100000
+    tftpboot 0x2000000 u-boot-2026.10-wireless-space-rs-ecc.raw
+    nand write.raw 0x2000000 0x0 0x14c     <- page count in HEX (332)
+Plain "nand write" of a .kwb into block 0 does NOT boot (no RS ECC).
+U-Boot itself never writes its own partition (flash_uboot is disabled).
+
+
+9. BACK TO STOCK LACIE FIRMWARE
+-------------------------------
+kwboot as in 8., then nand write.raw the stock dumps page-exact with OOB
+from your own backup (LaCie's firmware is not published here).
+
+
+10. BACKUPS
+-----------
+  - OpenWrt settings: LuCI System > Backup, or sysupgrade -b /tmp/backup.tar.gz
+    (contains password hashes: keep private)
+  - whole NAND: boot menu 10 (USB stick, raw pages + OOB and a data-only copy)

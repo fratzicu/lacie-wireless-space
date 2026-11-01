@@ -1,0 +1,201 @@
+LaCie Wireless Space - OpenWrt 25.12.6 + U-Boot 2026.10 (2026-10-30)
+=====================================================================
+
+Hardware: Marvell Kirkwood 88F6281 A1, 256 MB RAM, 128 MB NAND (Samsung,
+2048+64 pages, 128 KiB blocks, no bad blocks), 88E6161 switch (SMI 0xa,
+CPU port 5 RGMII), Ralink RT3092 Wi-Fi (rt2800pci). Serial 115200 8N1.
+
+STATUS on 2026-10-30
+- NAND: U-Boot 2026.10 (RS ECC) at 0x0, env at 0xC0000, OpenWrt UBI from
+  0x100000. Box on LAN1.
+- FLASHED 2026-10-30 (sysupgrade -v, config kept): the sysupgrade.bin in
+  this folder (sha256 486d4775...) runs on the box. Checked after the
+  upgrade: lan1 link came back by itself after netifd (40 s, no replug),
+  page 0 reg 16 = 0x2860 (EDPD off) and page 3 reg 16 = 0x1777 on PHY
+  0/1/2/6.
+- FLASHED AGAIN 2026-10-31 23:16 (sysupgrade -v, config kept): WAN LED fix
+  (DTS: wan PHY 6 page 3 reg 16 = 0x1767). The images in this folder are
+  now that build (sysupgrade sha256 363e9e0e...; the 2026-10-30 one was
+  486d4775...). Checked after the upgrade: PHY 0/1/2 = 0x1777, PHY 6 =
+  0x1767, EDPD off on all, wan and lan1 up at 1000 Mbit by themselves.
+- FLASHED AGAIN 2026-11-01 00:12 (sysupgrade -v, config kept): fan control,
+  ksmbd, fdisk, hd-idle (sysupgrade sha256 507b22bc...). Images here = that
+  build.
+  * Fan: DTS gpio-fan (stock kernel data: speed bits MPP37/7/36 active low,
+    power MPP38, MPP39 = high while turning -> alarm active low; stock RPM
+    table 1220/1325/1700/2000/3200/3800/4900/5400). /usr/sbin/ws-fan
+    (procd, every 30 s) sets fan1_target from the disk temperature
+    (drivetemp): <40 C 1220, 40-45 1700, 45-50 3200, 50-55 4900, 55+ 5400,
+    2 C hysteresis; no disk -> 1220. Logs to syslog (tag ws-fan).
+  * Disk: the internal SATA disk is on SATA port 1 = sda. The stock
+    firmware ran its main system from this disk (REGULAR_BOOT_DEVICE=0x801
+    = sda1). Mount it by UUID (block-mount), share it with ksmbd
+    (luci-app-ksmbd); hd-idle spins it down.
+  * Front LED: dark at that time; see 2026-11-01 20:40 below (the LED
+    itself was faulty, the board is fine).
+- FLASHED AGAIN 2026-11-01 ~20:40 (sysupgrade -v, config kept): front light
+  as in the stock manual, full wpad with WPS, WPS touch button
+  (sysupgrade sha256 cd094e43...).
+- FLASHED AGAIN 2026-11-01 ~21:05 (sysupgrade -v, config kept): touch
+  feedback (sysupgrade sha256 da964549...). Images here = that build.
+  Source: github.com/fratzicu/openwrt-upstream branch lacie-wireless-space,
+  github.com/fratzicu/u-boot branch wireless-space.
+  Flashing and recovery how-to: FLASHING.txt.
+  * Front light hardware: one common-anode RGB LED on connector J15 (VCC,
+    R, G, B) behind a latch. The original LED was dead (green and blue
+    drew no current on a bench supply, red flickered); replaced by three
+    5 mm LEDs (anodes to VCC, each through a resistor to R/G/B).
+    Latch, checked on the hardware: set the data lines, clock MPP42 low
+    and back high; the outputs hold while MPP42 stays high (data changes
+    without a clock do nothing). Data: MPP44 red, MPP46 green, MPP48 blue
+    (1 = on); MPP45 low = red blinks in hardware (~5 Hz, only with red
+    on); MPP47 low = blue switched to a disk activity input that stays
+    dark under OpenWrt, so kept high.
+  * Driver: kernel gpio-latch (CONFIG_GPIO_LATCH=y in config-6.12, clock
+    MPP42 active low) + gpio-leds: red:status, red:fault (= the MPP45
+    hardware blink), green:status, blue:status. DTS aliases: boot and
+    running = blue, failsafe = red, upgrade = green.
+  * Behaviour (manual 1.8 Light Behavior), /usr/sbin/ws-led + hooks:
+      off at power-on until the kernel loads the latch driver
+      blue fast / slower blinking   booting (preinit, then init)
+      blue steady                   ready, Wi-Fi on
+      green steady                  ready, Wi-Fi off (hotplug.d/net/50-ws-led)
+      other colour flickers         disk access (libata trigger ata1;
+                                    the stock blue flicker needs MPP47)
+      red steady                    no disk; shutdown/reboot (init K01ws-led,
+                                    seen on reboot 2026-11-01;
+                                    not after sysupgrade, which uses reboot -f)
+      red blinking                  failsafe
+      green, then blue/green/red    sysupgrade (diag.sh, then platform.sh)
+      blue/green fast (70 ms)       touch area held ("Sense cap pushed",
+                                    hotplug.d/button/10-ws-led)
+      green or blue steady          touch held 3 s: the Wi-Fi state on release
+      blue/green slow (300 ms)      WPS push-button session (rc.wps/10-ws-led,
+                                    until hostapd wps_status is not Active)
+  * WPS button = the front touch area ("sense cap", copper pad on the small
+    board at the front edge; GPIO43, gpio-keys). wpad-mbedtls replaces
+    wpad-basic-mbedtls (no WPS in basic). On the box:
+    wireless.default_radio0.wps_pushbutton=1 (set and committed).
+      touch < 3 s   WPS push-button pairing on the AP for 2 minutes
+                    (rc.wps/40-wps_ap)
+      touch >= 3 s  Wi-Fi on/off for all radios, saved (rc.wps/45-ws-wifi,
+                    syslog tag ws-wifi); replaces the WPS client mode
+                    (50-wps_sta) the WS has no use for
+    Tested 2026-11-01 with the case open (touching the pad directly);
+    through the closed front cover still to be checked after a
+    power-cycle with the cover on.
+
+FILES
+  openwrt-...-squashfs-sysupgrade.bin   final image (sysupgrade from OpenWrt)
+  openwrt-...-squashfs-factory.bin      same, for U-Boot web/TFTP/USB flash
+  openwrt-...-initramfs-uImage          RAM-only OpenWrt (TFTP boot, rescue)
+  openwrt-...manifest                   package list of the image
+  u-boot-2026.10-wireless-space.kwb     U-Boot kwbimage (kwboot / reference)
+  u-boot-2026.10-wireless-space-rs-ecc.raw   same, data+OOB pages with the
+                                        Marvell 4-bit RS ECC (332 pages), the
+                                        form that is in NAND block 0
+  kwrs.py                               RS ECC encoder/checker (BootROM ECC)
+  ysend.py                              YMODEM sender for U-Boot "loady"
+  openwrt-r33311-wireless-space.diff    OpenWrt changes (tree 64900e75, r33311)
+  u-boot-2026.10-wireless-space.diff    U-Boot changes (base 8649a54d301a)
+  openwrt-config-excerpt.txt            target + extra packages of the build
+  packages/                             all 192 packages of this build (apk)
+  docs/                                 stock user manual (PDF), board photos,
+                                        WAN LED note; see docs/README.txt
+  FLASHING.txt                          flashing/recovery how-to (sysupgrade,
+                                        U-Boot menu, web, TFTP, HTTP, USB, kwboot)
+  SHA256SUMS
+
+PACKAGES (packages/)
+  kirkwood-generic/  target packages and kmods; base/ luci/ packages/
+  routing/ telephony/ video/  the feeds; each folder has packages.adb.
+  The kmods only fit this kernel (kernel-6.12.112~bd9feb10...). The ones
+  from downloads.openwrt.org have another hash and do not install, so
+  take kmods from here. Normal userspace packages can come from the
+  official feeds as well.
+  The indexes are signed with the build key; public-key.pem here is the
+  same key the image ships in /etc/apk/keys/, so no --allow-untrusted.
+  Use: put the folder on a USB stick or web server, and add lines to
+  /etc/apk/repositories.d/customfeeds.list, e.g.
+    file:///mnt/sda1/packages/kirkwood-generic/packages.adb
+    http://192.168.1.2:PORT/packages/base/packages.adb
+  then apk update && apk add <pkg>.
+
+PORT MAPPING (case label = switch port = OpenWrt name)
+  LAN1 = port 2 = lan1,  LAN2 = port 1 = lan2,  LAN3 = port 0 = lan3,
+  WAN  = port 4 (PHY 6) = wan.  Port 3 has no socket.
+
+SOCKET LEDs AND LINK (found 2026-10-30, all in the DTS reg-init)
+- Each socket LED is driven by the switch PHY (88E1121R core), page 3 reg 16:
+  LED[0] = right LED green, LED[1] = right LED orange, LED[2] = not wired,
+  LED[3] = LEFT LED. The PHY reset default 0x1777 is right: green on at
+  1000 Mbit, orange on at 100 Mbit, left LED on with link and blinking with
+  activity. The marvell driver writes 0x0030, so the DTS writes 0x1777 back.
+- Wiring checked by forcing outputs (2026-10-31, mode 9 = on, 8 = off): the
+  right LED is a two-pin bicolor between LED[0] and LED[1] (both on = dark),
+  the left LED is green only, on LED[3]; LED[2] lights nothing. There is no
+  orange for the left LED.
+- WAN socket: LED[0] (green) is not wired, only orange. With 0x1777 the
+  right LED stayed dark at 1000 Mbit. The stock LaCie kernel writes the same
+  0x1777 (switch code, page 3 reg 16; variant with reg 17 = 0x44aa tested,
+  no green either), so it was never green there. WAN uses 0x1767:
+  LED[1] mode 6 = right LED orange with link (tested at 1000 and 100 Mbit;
+  10 Mbit untested, the far end has no 10 Mbit).
+  LED[1] modes on this PHY: 0/5 off, 1/2 link+activity, 3/4 activity only,
+  6 link at 100/1000, 7 link below 1000.
+- Do not write page 3 reg 18 (0x4105): writing 0x4100 there dropped the
+  wan link for ~12 s.
+- Energy-detect power-down (page 0 reg 16 bits 9:8, on by default) breaks the
+  link to a "green" switch: preinit drops the port at ~15 s, both ends go to
+  sleep, and netifd at ~35 s never gets a link back (only a cable replug
+  helped). The DTS clears the bits and soft-resets the PHY:
+    marvell,reg-init = <0 0x10 0xfcff 0>, <3 0x10 0 0x1777>,
+                       <0 0x00 0xffff 0x8000>;
+- Diagnostics in the image: ethtool-full, mdio-tools (kmod-mdio-netlink).
+  PHY bus: mdio '!ocp@f1000000!mdio-bus@72004!switch@a!mdio' phy N raw REG
+- LuCI: no swconfig "Switch" page with DSA. Ports and VLANs are under
+  Network > Interfaces > Devices > br-lan > Configure > "Bridge VLAN
+  filtering"; port status is on Status > Overview (Port status).
+
+OPENWRT FIXES (in the diff)
+- 204: mv88e6xxx probes without a PTP clock (6161 has TAI period 0).
+- 205: phylink only uses mac_select_pcs when it returns a PCS (fixes
+  "validation of gmii ... -EOPNOTSUPP" with the pending 737-02 patch).
+- New DTS, board.d network (lan1 lan2 lan3 / wan), image Makefile,
+  uboot-envtools (/dev/mtd1 0x0 0x20000 0x20000 2), bootcount.
+Build: make with the OpenWrt tree above, then
+  make -j8 (target kirkwood/generic, device lacie_wireless-space)
+
+U-BOOT 2026.10 (board LaCie/wireless_space)
+- Boot menu (3 s): OpenWrt NAND -> USB -> disk; TFTP/HTTP/PXE boot; web
+  recovery; flash from TFTP/USB/HTTP; NAND backup to USB; env reset.
+- Rear button held at power-on: web recovery at http://192.168.1.1/
+- env: ipaddr 192.168.1.1, serverip 192.168.1.2, bootlimit 3.
+- mvgbe fixed-link/RGMII fix + switch PHY power-up via Global2 (cold-start
+  Ethernet). flash_uboot is disabled on purpose (needs RS ECC, see below).
+- Build: make O=build-ws CROSS_COMPILE=arm-openwrt-linux-muslgnueabi-
+  (OpenWrt toolchain arm_xscale gcc 14.3.0 musl in PATH, STAGING_DIR set)
+
+FLASH / RECOVER
+1. Normal update (OpenWrt running):
+     sysupgrade -v /tmp/openwrt-...-squashfs-sysupgrade.bin
+2. OpenWrt broken, U-Boot fine: boot menu "Web recovery" (or rear button),
+   browse http://192.168.1.1/ and upload the factory.bin; or "Flash
+   firmware from TFTP server" (TFTP root of 192.168.1.2 must hold
+   openwrt-kirkwood-generic-lacie_wireless-space-squashfs-factory.bin;
+   "Boot initramfs from TFTP" loads the ...-initramfs-uImage the same way).
+3. U-Boot broken: UART boot with the patched kwboot (power-cycle the box,
+   kwboot catches the BootROM only on a real power-on, 15-20 s off):
+     kwboot -t -b u-boot-2026.10-wireless-space.kwb /dev/ttyUSBx
+   then rewrite block 0 from that RAM U-Boot:
+     nand erase 0x0 0x100000
+     tftpboot 0x2000000 u-boot-2026.10-wireless-space-rs-ecc.raw
+     nand write.raw 0x2000000 0x0 0x14c     <- page count is HEX (332)
+   The BootROM reads block 0 only with the Marvell 4-bit RS ECC (10 bytes
+   per 512 B in OOB 24-63), which neither mainline U-Boot nor Linux write;
+   hence the pre-encoded .raw (kwrs.py encode u-boot.kwb out.raw).
+4. Back to stock LaCie: kwboot as in 3, then nand write.raw the stock dumps
+   (mtd0 + mtd1 here, mtd2 from the full backup), page-exact with OOB.
+
+OPEN POINTS
+- WPS touch through the closed front cover: to be tested.
