@@ -12,6 +12,1343 @@ index 77e386fd24..37a8a1eae2 100644
  linksys,ea3500)
  	ubootenv_add_uci_config "/dev/mtd1" "0x0" "0x4000" "0x4000"
  	;;
+diff --git a/package/lacie/luci-app-disk-init/Makefile b/package/lacie/luci-app-disk-init/Makefile
+new file mode 100644
+index 0000000000..5fc4f8a48a
+--- /dev/null
++++ b/package/lacie/luci-app-disk-init/Makefile
+@@ -0,0 +1,51 @@
++include $(TOPDIR)/rules.mk
++
++PKG_NAME:=luci-app-disk-init
++PKG_VERSION:=2
++PKG_RELEASE:=1
++PKG_LICENSE:=GPL-2.0-only
++
++include $(INCLUDE_DIR)/package.mk
++
++define Package/luci-app-disk-init
++  SECTION:=luci
++  CATEGORY:=LuCI
++  SUBMENU:=3. Applications
++  TITLE:=LuCI page to set up storage disks and share them over SMB, FTP and NFS
++  DEPENDS:=+luci-base +rpcd +sfdisk +e2fsprogs +block-mount +libblkid
++  PKGARCH:=all
++endef
++
++define Package/luci-app-disk-init/description
++  System > Storage: lists the SATA/USB disks and initialises one for
++  storage (GPT, one partition with any file system whose mkfs tool and
++  kernel support are installed, mounted by UUID at /mnt/<name>), shares the
++  mounted folders over SMB (ksmbd), FTP (vsftpd) and NFS
++  (nfs-kernel-server), and manages separate SMB and FTP users. All settings
++  are kept in the services' own OpenWrt configuration.
++endef
++
++define Build/Compile
++endef
++
++define Package/luci-app-disk-init/install
++	$(INSTALL_DIR) $(1)/usr/libexec/rpcd $(1)/usr/sbin
++	$(INSTALL_BIN) ./root/usr/libexec/rpcd/disk-init $(1)/usr/libexec/rpcd/
++	$(INSTALL_BIN) ./root/usr/sbin/disk-init $(1)/usr/sbin/
++	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d $(1)/usr/share/rpcd/acl.d
++	$(INSTALL_DATA) ./root/usr/share/luci/menu.d/luci-app-disk-init.json $(1)/usr/share/luci/menu.d/
++	$(INSTALL_DATA) ./root/usr/share/rpcd/acl.d/luci-app-disk-init.json $(1)/usr/share/rpcd/acl.d/
++	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/system
++	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/system/disk-init.js $(1)/www/luci-static/resources/view/system/
++endef
++
++define Package/luci-app-disk-init/postinst
++#!/bin/sh
++[ -n "$${IPKG_INSTROOT}" ] || {
++	/etc/init.d/rpcd reload
++	rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache
++}
++exit 0
++endef
++
++$(eval $(call BuildPackage,luci-app-disk-init))
+diff --git a/package/lacie/luci-app-disk-init/htdocs/luci-static/resources/view/system/disk-init.js b/package/lacie/luci-app-disk-init/htdocs/luci-static/resources/view/system/disk-init.js
+new file mode 100644
+index 0000000000..fe144e47f1
+--- /dev/null
++++ b/package/lacie/luci-app-disk-init/htdocs/luci-static/resources/view/system/disk-init.js
+@@ -0,0 +1,468 @@
++'use strict';
++'require view';
++'require rpc';
++'require ui';
++'require poll';
++
++const callStatus = rpc.declare({
++	object: 'disk-init',
++	method: 'status'
++});
++
++const callInit = rpc.declare({
++	object: 'disk-init',
++	method: 'init',
++	params: [ 'disk', 'label', 'fstype' ]
++});
++
++const callShares = rpc.declare({
++	object: 'disk-init',
++	method: 'shares'
++});
++
++const callSetShare = rpc.declare({
++	object: 'disk-init',
++	method: 'set_share',
++	params: [ 'path', 'smb', 'smb_users', 'smb_ro', 'ftp_anon', 'nfs', 'nfs_clients', 'nfs_ro' ]
++});
++
++const callSetUser = rpc.declare({
++	object: 'disk-init',
++	method: 'set_user',
++	params: [ 'service', 'action', 'name', 'password', 'root', 'write' ]
++});
++
++const FSTYPES = {
++	ext4: _('ext4 - Linux, recommended'),
++	xfs: _('XFS - Linux, large files'),
++	btrfs: _('Btrfs - Linux, checksums and snapshots'),
++	f2fs: _('F2FS - Linux, for flash and SSD'),
++	exfat: _('exFAT - also readable on Windows and macOS'),
++	vfat: _('FAT32 - readable everywhere, files up to 4 GB'),
++	ntfs: _('NTFS - Windows')
++};
++
++function fmtSize(kib) {
++	return '%1024.1mB'.format(kib * 1024);
++}
++
++function field(title, input, descr) {
++	return E('div', { 'class': 'cbi-value' }, [
++		E('label', { 'class': 'cbi-value-title' }, [ title ]),
++		E('div', { 'class': 'cbi-value-field' }, [
++			input,
++			descr ? E('div', { 'class': 'cbi-value-description' }, [ descr ]) : ''
++		])
++	]);
++}
++
++function checkbox(checked, label) {
++	const cb = E('input', { 'type': 'checkbox' });
++	cb.checked = !!checked;
++	return { input: cb, node: E('label', {}, [ cb, ' ', label ]) };
++}
++
++function modalButtons(handler, label, negative) {
++	return E('div', { 'class': 'right' }, [
++		E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]), ' ',
++		E('button', {
++			'class': 'btn ' + (negative ? 'cbi-button-negative' : 'cbi-button-positive'),
++			'click': handler
++		}, [ label ])
++	]);
++}
++
++function warn(msg) {
++	ui.addNotification(null, E('p', [ msg ]), 'warning');
++}
++
++return view.extend({
++	load: function() {
++		return Promise.all([ callStatus(), callShares() ]);
++	},
++
++	refresh: function() {
++		return Promise.all([ callStatus(), callShares() ]).then(L.bind(function(res) {
++			this.st = res[0];
++			this.sh = res[1];
++			this.renderLog();
++			this.nodes.disks.replaceChildren(this.renderDisks());
++			this.nodes.folders.replaceChildren(this.renderFolders());
++			this.nodes.smbUsers.replaceChildren(this.renderSmbUsers());
++			this.nodes.ftpUsers.replaceChildren(this.renderFtpUsers());
++		}, this));
++	},
++
++	/* runs an rpc call from a modal, shows its error or closes the modal */
++	submit: function(call) {
++		return call.then(L.bind(function(res) {
++			if (res && res.error) {
++				ui.addNotification(null, E('p', [ res.error ]), 'danger');
++				return;
++			}
++			ui.hideModal();
++			if (res && res.warning)
++				warn(res.warning);
++			return this.refresh();
++		}, this)).catch(function(err) {
++			ui.addNotification(null, E('p', [ err.message || String(err) ]), 'danger');
++		});
++	},
++
++	/* ---- disks ---- */
++
++	renderLog: function() {
++		const box = this.nodes.log, st = this.st;
++
++		if (!st.state) {
++			box.style.display = 'none';
++			return;
++		}
++
++		const titles = {
++			running: _('Setting up the disk...'),
++			done: _('Disk setup finished'),
++			failed: _('Disk setup failed')
++		};
++
++		box.style.display = '';
++		box.className = 'alert-message ' +
++			(st.state == 'failed' ? 'error' : (st.state == 'done' ? 'success' : 'notice'));
++		box.replaceChildren(
++			E('h4', {}, [ titles[st.state] || st.state ]),
++			E('pre', { 'style': 'white-space:pre-wrap' }, [ st.log || '' ])
++		);
++	},
++
++	confirmInit: function(disk) {
++		const name = [ disk.vendor, disk.model ].filter(Boolean).join(' ') || disk.name;
++		const label = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'value': 'data', 'maxlength': 16 });
++		const fstype = E('select', { 'class': 'cbi-input-select' },
++			(this.st.fstypes || []).map(function(t) {
++				return E('option', { 'value': t }, [ FSTYPES[t] || t ]);
++			}));
++		const sure = checkbox(false, E('strong', {}, [ _('I understand that all data on this disk will be lost') ]));
++
++		ui.showModal(_('Initialize %s').format('/dev/' + disk.name), [
++			E('p', { 'class': 'alert-message warning' }, [
++				_('ALL DATA on %s (%s, %s) will be erased: every partition and file on it.')
++					.format('/dev/' + disk.name, name, fmtSize(disk.size)) ]),
++			E('p', {}, [ _('The disk gets one partition with the chosen file system, mounted at /mnt/<name> at every boot. Share it afterwards under Shared folders.') ]),
++			field(_('Name'), label,
++				_('1 to 16 letters, digits, - or _. Used as file system label (shortened if the file system needs it) and folder name.')),
++			field(_('File system'), fstype),
++			E('p', {}, [ sure.node ]),
++			modalButtons(ui.createHandlerFn(this, function() {
++				if (!sure.input.checked)
++					return warn(_('Tick the confirmation box first.'));
++				if (!/^[A-Za-z0-9_-]{1,16}$/.test(label.value))
++					return warn(_('Name: 1 to 16 letters, digits, - or _.'));
++				return this.submit(callInit(disk.name, label.value, fstype.value));
++			}), _('Erase and initialize'), true)
++		]);
++	},
++
++	renderDisks: function() {
++		const st = this.st;
++		const table = E('table', { 'class': 'table' }, [
++			E('tr', { 'class': 'tr table-titles' }, [
++				E('th', { 'class': 'th' }, [ _('Disk') ]),
++				E('th', { 'class': 'th' }, [ _('Model') ]),
++				E('th', { 'class': 'th' }, [ _('Size') ]),
++				E('th', { 'class': 'th' }, [ _('Partitions') ]),
++				E('th', { 'class': 'th' }, '')
++			])
++		]);
++
++		(st.disks || []).forEach(L.bind(function(d) {
++			const parts = (d.partitions || []).map(function(p) {
++				return E('div', {}, [ '%s: %s %s%s%s'.format(
++					p.name, fmtSize(p.size), p.type || _('unknown'),
++					p.label ? ' "' + p.label + '"' : '',
++					p.mount ? ' → ' + p.mount : '') ]);
++			});
++
++			table.appendChild(E('tr', { 'class': 'tr' }, [
++				E('td', { 'class': 'td' }, [ '/dev/%s (%s)'.format(d.name, d.bus.toUpperCase()) ]),
++				E('td', { 'class': 'td' }, [ [ d.vendor, d.model ].filter(Boolean).join(' ') ]),
++				E('td', { 'class': 'td' }, [ fmtSize(d.size) ]),
++				E('td', { 'class': 'td' }, parts.length ? parts : [ E('em', {}, [ _('none') ]) ]),
++				E('td', { 'class': 'td' }, [ E('button', {
++					'class': 'btn cbi-button-negative',
++					'disabled': st.state == 'running' ? '' : null,
++					'click': ui.createHandlerFn(this, 'confirmInit', d)
++				}, [ _('Initialize...') ]) ])
++			]));
++		}, this));
++
++		if (!(st.disks || []).length)
++			table.appendChild(E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td', 'colspan': 5 },
++				[ E('em', {}, [ _('No SATA or USB disk found.') ]) ]) ]));
++
++		return table;
++	},
++
++	/* ---- shared folders ---- */
++
++	editShare: function(f) {
++		const sh = this.sh, svc = sh.services || {};
++		const smb = E('select', { 'class': 'cbi-input-select' }, [
++			E('option', { 'value': 'off' }, [ _('Not shared') ]),
++			E('option', { 'value': 'guest' }, [ _('Everyone, no password') ]),
++			E('option', { 'value': 'users' }, [ _('Only these SMB users') ])
++		]);
++		smb.value = f.smb || 'off';
++		const current = (f.smb_users || '').split(/\s+/);
++		const users = (sh.smb_users || []).map(function(u) {
++			return Object.assign(checkbox(current.indexOf(u) >= 0, u), { name: u });
++		});
++		const userBox = E('div', {}, users.length
++			? users.map(function(u) { return E('div', {}, [ u.node ]); })
++			: [ E('em', {}, [ _('No SMB users yet: add them under SMB users.') ]) ]);
++		const smbRo = checkbox(f.smb_ro, _('Read-only'));
++		const showUsers = function() { userBox.style.display = smb.value == 'users' ? '' : 'none'; };
++		smb.addEventListener('change', showUsers);
++		showUsers();
++
++		const anon = sh.folders.filter(function(o) { return o.ftp_anon && o.path != f.path; })[0];
++		const ftpAnon = checkbox(f.ftp_anon, _('Anonymous FTP, read-only'));
++
++		const nfs = checkbox(f.nfs, _('Export over NFS'));
++		const nfsClients = E('input', { 'type': 'text', 'class': 'cbi-input-text',
++			'value': f.nfs_clients || sh.lan_subnet || '*' });
++		const nfsRo = checkbox(f.nfs_ro, _('Read-only'));
++
++		ui.showModal(_('Sharing of %s').format(f.path), [
++			E('h4', {}, [ _('SMB (Windows, macOS, Linux file sharing)') ]),
++			svc.smb ? E('div', {}, [
++				field(_('Access'), smb),
++				field(_('Users'), userBox),
++				field('', smbRo.node)
++			]) : E('p', {}, [ E('em', {}, [ _('ksmbd is not installed.') ]) ]),
++			E('h4', {}, [ _('FTP') ]),
++			svc.ftp ? E('div', {}, [
++				field('', ftpAnon.node, anon
++					? _('Only one folder can be the anonymous FTP folder; this moves it from %s.').format(anon.path)
++					: _('Anyone can download from this folder without a password. FTP users get their folder under FTP users.'))
++			]) : E('p', {}, [ E('em', {}, [ _('vsftpd is not installed.') ]) ]),
++			E('h4', {}, [ _('NFS (Linux, macOS)') ]),
++			svc.nfs ? E('div', {}, [
++				field('', nfs.node),
++				field(_('Clients'), nfsClients,
++					_('Who may mount it: networks like 192.168.1.0/24, addresses or host names, separated by spaces, or * for everyone. Files are written as user nobody.')),
++				field('', nfsRo.node)
++			]) : E('p', {}, [ E('em', {}, [ _('nfs-kernel-server is not installed.') ]) ]),
++			modalButtons(ui.createHandlerFn(this, function() {
++				const chosen = users.filter(function(u) { return u.input.checked; })
++					.map(function(u) { return u.name; });
++				if (svc.smb && smb.value == 'users' && !chosen.length)
++					return warn(_('Choose at least one SMB user, or another access.'));
++				return this.submit(callSetShare(f.path, smb.value, chosen.join(' '),
++					smbRo.input.checked, ftpAnon.input.checked, nfs.input.checked,
++					nfsClients.value.trim(), nfsRo.input.checked));
++			}), _('Save'))
++		]);
++	},
++
++	renderFolders: function() {
++		const sh = this.sh;
++		const table = E('table', { 'class': 'table' }, [
++			E('tr', { 'class': 'tr table-titles' }, [
++				E('th', { 'class': 'th' }, [ _('Folder') ]),
++				E('th', { 'class': 'th' }, [ _('Disk') ]),
++				E('th', { 'class': 'th' }, [ _('Free') ]),
++				E('th', { 'class': 'th' }, [ 'SMB' ]),
++				E('th', { 'class': 'th' }, [ 'FTP' ]),
++				E('th', { 'class': 'th' }, [ 'NFS' ]),
++				E('th', { 'class': 'th' }, '')
++			])
++		]);
++
++		(sh.folders || []).forEach(L.bind(function(f) {
++			const ro = function(x) { return x ? ' (' + _('read-only') + ')' : ''; };
++			const smb = {
++				off: '-',
++				guest: _('everyone') + ro(f.smb_ro),
++				users: (f.smb_users || '').split(/\s+/).join(', ') + ro(f.smb_ro)
++			}[f.smb] || '-';
++
++			table.appendChild(E('tr', { 'class': 'tr' }, [
++				E('td', { 'class': 'td' }, [ f.path ]),
++				E('td', { 'class': 'td' }, [ '%s, %s%s'.format(f.dev.replace('/dev/', ''), f.fstype,
++					f.label ? ' "' + f.label + '"' : '') ]),
++				E('td', { 'class': 'td' }, [ fmtSize(f.free) ]),
++				E('td', { 'class': 'td' }, [ (f.smb != 'off' && f.smb_name ? '\\\\' + f.smb_name + ': ' : '') + smb ]),
++				E('td', { 'class': 'td' }, [ f.ftp_anon ? _('anonymous, read-only') : '-' ]),
++				E('td', { 'class': 'td' }, [ f.nfs ? f.nfs_clients + ro(f.nfs_ro) : '-' ]),
++				E('td', { 'class': 'td' }, [ E('button', {
++					'class': 'btn cbi-button-edit',
++					'click': ui.createHandlerFn(this, 'editShare', f)
++				}, [ _('Edit...') ]) ])
++			]));
++		}, this));
++
++		if (!(sh.folders || []).length)
++			table.appendChild(E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td', 'colspan': 7 },
++				[ E('em', {}, [ _('No disk is mounted. Initialize one above, or mount it under System → Mount Points.') ]) ]) ]));
++
++		return table;
++	},
++
++	/* ---- users ---- */
++
++	editUser: function(service, user) {
++		const sh = this.sh, add = !user;
++		const name = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'maxlength': 32,
++			'value': add ? '' : user.name, 'disabled': add ? null : '' });
++		const pw1 = E('input', { 'type': 'password', 'class': 'cbi-input-password' });
++		const pw2 = E('input', { 'type': 'password', 'class': 'cbi-input-password' });
++		let root, write;
++		const extra = [];
++
++		if (service == 'ftp') {
++			root = E('select', { 'class': 'cbi-input-select' }, [
++				E('option', { 'value': '/mnt' }, [ _('/mnt - all disks') ])
++			].concat((sh.folders || []).map(function(f) {
++				return E('option', { 'value': f.path }, [ f.path ]);
++			})));
++			root.value = add ? '/mnt' : user.root;
++			write = checkbox(add ? true : user.write, _('May upload, change and delete files'));
++			extra.push(field(_('Folder'), root, _('The user sees only this folder.')),
++				field('', write.node));
++		}
++
++		const title = service == 'smb'
++			? (add ? _('Add SMB user') : _('SMB user %s').format(user.name))
++			: (add ? _('Add FTP user') : _('FTP user %s').format(user.name));
++
++		ui.showModal(title, [
++			field(_('User name'), name, add ? _('Small letters, digits, - or _.') : null),
++			field(_('Password'), pw1, add ? null : _('Leave empty to keep the current password.')),
++			field(_('Repeat password'), pw2)
++		].concat(extra, [
++			modalButtons(ui.createHandlerFn(this, function() {
++				if (pw1.value != pw2.value)
++					return warn(_('The passwords do not match.'));
++				if ((add || service == 'smb') && !pw1.value)
++					return warn(_('Enter a password.'));
++				return this.submit(callSetUser(service, add ? 'add' : 'set', name.value.trim(),
++					pw1.value, root ? root.value : '', write ? write.input.checked : true));
++			}), _('Save'))
++		]));
++	},
++
++	deleteUser: function(service, name) {
++		ui.showModal(_('Delete %s user %s').format(service.toUpperCase(), name), [
++			E('p', {}, [ _('The user can no longer log in over %s. Files stay where they are.')
++				.format(service.toUpperCase()) ]),
++			modalButtons(ui.createHandlerFn(this, function() {
++				return this.submit(callSetUser(service, 'delete', name, '', '', false));
++			}), _('Delete'), true)
++		]);
++	},
++
++	userTable: function(service, rows, cols) {
++		const table = E('table', { 'class': 'table' }, [
++			E('tr', { 'class': 'tr table-titles' }, cols.map(function(c) {
++				return E('th', { 'class': 'th' }, [ c ]);
++			}).concat([ E('th', { 'class': 'th' }, '') ]))
++		]);
++
++		rows.forEach(L.bind(function(r) {
++			table.appendChild(E('tr', { 'class': 'tr' }, r.cells.map(function(c) {
++				return E('td', { 'class': 'td' }, [ c ]);
++			}).concat([ E('td', { 'class': 'td' }, [
++				E('button', { 'class': 'btn cbi-button-edit',
++					'click': ui.createHandlerFn(this, 'editUser', service, r.user) },
++					[ service == 'smb' ? _('Password...') : _('Edit...') ]), ' ',
++				E('button', { 'class': 'btn cbi-button-remove',
++					'click': ui.createHandlerFn(this, 'deleteUser', service, r.user.name) },
++					[ _('Delete') ])
++			]) ])));
++		}, this));
++
++		if (!rows.length)
++			table.appendChild(E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td', 'colspan': cols.length + 1 },
++				[ E('em', {}, [ _('No users yet.') ]) ]) ]));
++
++		return E([
++			table,
++			E('div', { 'class': 'cbi-section-create' }, [ E('button', {
++				'class': 'btn cbi-button-add',
++				'click': ui.createHandlerFn(this, 'editUser', service, null)
++			}, [ _('Add user...') ]) ])
++		]);
++	},
++
++	renderSmbUsers: function() {
++		if (!(this.sh.services || {}).smb)
++			return E('em', {}, [ _('ksmbd is not installed.') ]);
++		return this.userTable('smb', (this.sh.smb_users || []).map(function(u) {
++			return { user: { name: u }, cells: [ u ] };
++		}), [ _('User') ]);
++	},
++
++	renderFtpUsers: function() {
++		if (!(this.sh.services || {}).ftp)
++			return E('em', {}, [ _('vsftpd is not installed.') ]);
++		return this.userTable('ftp', (this.sh.ftp_users || []).map(function(u) {
++			return { user: u, cells: [ u.name, u.root,
++				u.write ? _('read and write') : _('read-only') ] };
++		}), [ _('User'), _('Folder'), _('Access') ]);
++	},
++
++	section: function(title, descr, node) {
++		return E('div', { 'class': 'cbi-section' }, [
++			E('h3', {}, [ title ]),
++			descr ? E('p', { 'class': 'cbi-section-descr' }, [ descr ]) : '',
++			node
++		]);
++	},
++
++	render: function(res) {
++		this.st = res[0];
++		this.sh = res[1];
++		this.nodes = {
++			log: E('div', { 'style': 'display:none' }),
++			disks: E('div', {}, this.renderDisks()),
++			folders: E('div', {}, this.renderFolders()),
++			smbUsers: E('div', {}, this.renderSmbUsers()),
++			ftpUsers: E('div', {}, this.renderFtpUsers())
++		};
++		this.renderLog();
++
++		let last = this.st.state;
++		poll.add(L.bind(function() {
++			return callStatus().then(L.bind(function(s) {
++				const finished = last == 'running' && s.state != 'running';
++				last = s.state;
++				if (finished)
++					return this.refresh();
++				this.st = s;
++				this.renderLog();
++				this.nodes.disks.replaceChildren(this.renderDisks());
++			}, this));
++		}, this), 3);
++
++		return E([
++			E('h2', {}, [ _('Storage') ]),
++			E('p', { 'class': 'cbi-section-descr' }, [
++				_('Prepare disks and share them on the network over SMB, FTP and NFS. The settings are stored in the usual OpenWrt places, so Services → Network Shares and the configuration files show the same.') ]),
++			this.nodes.log,
++			this.section(_('Disks'),
++				_('Initialize erases a disk and gives it one partition with a file system of your choice, mounted at boot. Disks that already hold data can be mounted under System → Mount Points instead.'),
++				this.nodes.disks),
++			this.section(_('Shared folders'), null, this.nodes.folders),
++			this.section(_('SMB users'),
++				_('Accounts for SMB shares limited to users. They cannot log in to the router itself.'),
++				this.nodes.smbUsers),
++			this.section(_('FTP users'),
++				_('Accounts for FTP, separate from the SMB users and with their own password; a name can be in both lists. Each user is locked into one folder.'),
++				this.nodes.ftpUsers)
++		]);
++	},
++
++	handleSave: null,
++	handleSaveApply: null,
++	handleReset: null
++});
+diff --git a/package/lacie/luci-app-disk-init/root/usr/libexec/rpcd/disk-init b/package/lacie/luci-app-disk-init/root/usr/libexec/rpcd/disk-init
+new file mode 100644
+index 0000000000..3ff5d7e40a
+--- /dev/null
++++ b/package/lacie/luci-app-disk-init/root/usr/libexec/rpcd/disk-init
+@@ -0,0 +1,557 @@
++#!/bin/sh
++# rpcd plugin for the LuCI "Storage" page
++#   status:    SATA/USB disks with their partitions, the file systems that can
++#              be created, and the state of a running or finished
++#              initialisation (/tmp/disk-init.*)
++#   init:      start /usr/sbin/disk-init in the background (formatting a large
++#              disk takes longer than an rpcd call may)
++#   shares:    storage folders (mounted disk partitions) with their SMB, NFS and
++#              anonymous FTP sharing, and the SMB and FTP users
++#   set_share: change the sharing of one folder
++#   set_user:  add, change or delete an SMB or FTP user
++#
++# Everything is kept where OpenWrt keeps it, so it can also be changed by hand
++# or on the Network Shares page:
++#   SMB shares      /etc/config/ksmbd
++#   SMB users       system account (no shell) + /etc/ksmbd/ksmbdpwd.db
++#   FTP             /etc/vsftpd.conf, users in /etc/vsftpd/vsftpd.users,
++#                   per-user folder/write access in /etc/vsftpd/users/<name>,
++#                   system account (no shell) with its password in /etc/shadow
++#   NFS             /etc/exports
++
++. /usr/share/libubox/jshn.sh
++. /lib/functions.sh
++
++STATE=/tmp/disk-init.state
++LOG=/tmp/disk-init.log
++PWDDB=/etc/ksmbd/ksmbdpwd.db
++VSFTPD_CONF=/etc/vsftpd.conf
++FTP_USERS=/etc/vsftpd/vsftpd.users
++FTP_USERDIR=/etc/vsftpd/users
++NOT_USERS='root daemon ftp network nobody anonymous'
++
++reply_error() {
++	json_init
++	json_add_string error "$*"
++	json_dump
++	exit 0
++}
++
++blkval() {	# blkval <dev> <KEY>: value from "block info"
++	block info "$1" 2>/dev/null | sed -n "s/.* $2=\"\([^\"]*\)\".*/\1/p"
++}
++
++add_disk() {
++	local d=$1 sys=/sys/block/$1 p dev mnt bus
++
++	case "$(readlink -f $sys)" in
++	*/usb*) bus=usb ;;
++	*/ata*) bus=sata ;;
++	*) bus=other ;;
++	esac
++
++	json_add_object
++	json_add_string name "$d"
++	json_add_string bus "$bus"
++	json_add_string vendor "$(cat $sys/device/vendor 2>/dev/null | sed 's/ *$//')"
++	json_add_string model "$(cat $sys/device/model 2>/dev/null | sed 's/ *$//')"
++	json_add_double size "$(( $(cat $sys/size) / 2 ))"	# KiB
++	json_add_array partitions
++	for p in $sys/${d}*; do
++		[ -e "$p/partition" ] || continue
++		dev=/dev/${p##*/}
++		mnt=$(awk -v d="$dev" '$1 == d { print $2; exit }' /proc/mounts)
++		json_add_object
++		json_add_string name "${p##*/}"
++		json_add_double size "$(( $(cat $p/size) / 2 ))"
++		json_add_string type "$(blkval $dev TYPE)"
++		json_add_string label "$(blkval $dev LABEL)"
++		json_add_string uuid "$(blkval $dev UUID)"
++		json_add_string mount "$mnt"
++		json_close_object
++	done
++	json_close_array
++	json_close_object
++}
++
++# storage folders: mount points of SATA/USB disk partitions
++folders() {
++	awk '$1 ~ "^/dev/sd[a-z][0-9]*$" && $2 != "/" && $2 !~ "^/(overlay|rom)" { print $1, $2, $3 }' /proc/mounts
++}
++
++is_folder() {
++	folders | awk -v p="$1" '$2 == p { f = 1 } END { exit !f }'
++}
++
++smb_users() {
++	[ -f $PWDDB ] && cut -d: -f1 $PWDDB
++}
++
++ftp_users() {
++	[ -f $FTP_USERS ] && grep -v -x -E 'anonymous|ftp|' $FTP_USERS
++}
++
++in_list() {	# in_list <word> <list>
++	echo " $2 " | tr '\n' ' ' | grep -q " $1 "
++}
++
++conf_get() {	# conf_get <key>: value from vsftpd.conf
++	sed -n "s/^$1=//p" $VSFTPD_CONF 2>/dev/null | tail -n 1
++}
++
++conf_set() {	# conf_set <key> <value>: set a vsftpd.conf line (replaces the
++		# first, commented or not, and drops the other ones)
++	awk -v k="$1" -v v="$2" '
++		$0 ~ "^#?" k "=" { if (!d) print k "=" v; d = 1; next }
++		{ print }
++		END { if (!d) print k "=" v }' $VSFTPD_CONF > $VSFTPD_CONF.new &&
++		cat $VSFTPD_CONF.new > $VSFTPD_CONF
++	rm -f $VSFTPD_CONF.new
++}
++
++# --- shares ---------------------------------------------------------------
++
++smb_find() {	# sets SMB_SEC to the ksmbd share with path $SMB_PATH
++	local path
++	config_get path "$1" path
++	[ -z "$SMB_SEC" ] && [ "$path" = "$SMB_PATH" ] && SMB_SEC=$1
++}
++
++smb_section() {	# smb_section <path>
++	SMB_SEC=
++	SMB_PATH=$1
++	[ -e /etc/config/ksmbd ] || return
++	config_load ksmbd
++	config_foreach smb_find share
++}
++
++add_folder() {
++	local dev=$1 path=$2 fstype=$3 guest users ro name exp
++
++	json_add_object
++	json_add_string path "$path"
++	json_add_string dev "$dev"
++	json_add_string fstype "$fstype"
++	json_add_string label "$(blkval $dev LABEL)"
++	json_add_double free "$(df -k "$path" | awk 'NR == 2 { print $4 }')"
++
++	smb_section "$path"
++	if [ -n "$SMB_SEC" ]; then
++		config_get name "$SMB_SEC" name
++		config_get guest "$SMB_SEC" guest_ok
++		config_get users "$SMB_SEC" users
++		config_get ro "$SMB_SEC" read_only
++		json_add_string smb "$( [ -n "$users" ] && echo users || echo guest )"
++		json_add_string smb_name "$name"
++		json_add_string smb_users "$(echo $users | tr ',' ' ')"
++		json_add_boolean smb_ro "$( [ "$ro" = yes ] && echo 1 || echo 0 )"
++	else
++		json_add_string smb off
++	fi
++
++	json_add_boolean ftp_anon "$( [ "$(conf_get anonymous_enable)" = YES ] &&
++		[ "$(conf_get anon_root)" = "$path" ] && echo 1 || echo 0 )"
++
++	exp=$(awk -v p="$path" '$1 == p { $1 = ""; print; exit }' /etc/exports 2>/dev/null)
++	if [ -n "$exp" ]; then
++		json_add_boolean nfs 1
++		json_add_string nfs_clients "$(echo $exp | sed 's/([^)]*)//g')"
++		json_add_boolean nfs_ro "$(echo "$exp" | grep -q '(ro[,)]' && echo 1 || echo 0)"
++	else
++		json_add_boolean nfs 0
++	fi
++	json_close_object
++}
++
++lan_subnet() {
++	local addr
++	. /lib/functions/network.sh
++	network_get_subnet addr lan || return
++	eval "$(/bin/ipcalc.sh "$addr")"
++	echo "$NETWORK/$PREFIX"
++}
++
++do_shares() {
++	local u r w f dev path fstype
++
++	json_init
++	json_add_object services
++	json_add_boolean smb "$( [ -x /etc/init.d/ksmbd ] && echo 1 || echo 0 )"
++	json_add_boolean ftp "$( [ -x /etc/init.d/vsftpd ] && echo 1 || echo 0 )"
++	json_add_boolean nfs "$( [ -x /etc/init.d/nfsd ] && echo 1 || echo 0 )"
++	json_close_object
++	json_add_string lan_subnet "$(lan_subnet)"
++
++	json_add_array folders
++	f=$(folders)
++	while read -r dev path fstype; do
++		[ -n "$dev" ] && add_folder "$dev" "$path" "$fstype"
++	done <<-EOF
++	$f
++	EOF
++	json_close_array
++
++	json_add_array smb_users
++	for u in $(smb_users); do json_add_string "" "$u"; done
++	json_close_array
++
++	json_add_array ftp_users
++	for u in $(ftp_users); do
++		f=$FTP_USERDIR/$u
++		r=$(sed -n 's/^local_root=//p' $f 2>/dev/null)
++		w=$(sed -n 's/^write_enable=//p' $f 2>/dev/null)
++		json_add_object
++		json_add_string name "$u"
++		json_add_string root "${r:-/mnt}"
++		json_add_boolean write "$( [ "$w" = NO ] && echo 0 || echo 1 )"
++		json_close_object
++	done
++	json_close_array
++	json_dump
++}
++
++service_on() {	# service_on <init script>: enable and (re)start
++	/etc/init.d/$1 enable
++	/etc/init.d/$1 restart >/dev/null 2>&1
++}
++
++service_off() {
++	/etc/init.d/$1 stop >/dev/null 2>&1
++	/etc/init.d/$1 disable
++}
++
++vsftpd_base() {	# the settings the Storage page relies on
++	mkdir -p $FTP_USERDIR
++	touch $FTP_USERS
++	conf_set listen YES
++	conf_set local_enable YES
++	conf_set write_enable YES
++	conf_set local_umask 000
++	conf_set check_shell NO
++	conf_set chroot_local_user YES
++	conf_set allow_writeable_chroot YES
++	conf_set userlist_enable YES
++	conf_set userlist_deny NO
++	conf_set userlist_file $FTP_USERS
++	conf_set user_config_dir $FTP_USERDIR
++	conf_set no_anon_password YES
++	conf_set anon_upload_enable NO
++	conf_set anon_mkdir_write_enable NO
++	conf_set anon_other_write_enable NO
++}
++
++vsftpd_apply() {
++	if [ "$(conf_get anonymous_enable)" = YES ] || [ -n "$(ftp_users)" ]; then
++		service_on vsftpd
++	else
++		service_off vsftpd
++	fi
++}
++
++do_set_share() {
++	local path smb smb_users smb_ro ftp_anon nfs nfs_clients nfs_ro
++	local name opt c line u
++
++	json_get_vars path smb smb_users smb_ro ftp_anon nfs nfs_clients nfs_ro
++	is_folder "$path" || reply_error "$path is not a mounted storage folder"
++
++	# SMB
++	if [ -x /etc/init.d/ksmbd ]; then
++		smb_section "$path"
++		case "$smb" in
++		off)
++			[ -n "$SMB_SEC" ] && uci delete ksmbd.$SMB_SEC
++			;;
++		guest|users)
++			if [ "$smb" = users ]; then
++				smb_users=$(echo $smb_users | tr ',' ' ')
++				[ -n "$smb_users" ] || reply_error "choose at least one SMB user"
++				for u in $smb_users; do
++					in_list "$u" "$(smb_users)" || reply_error "unknown SMB user $u"
++				done
++			else
++				smb_users=
++			fi
++			if [ -z "$SMB_SEC" ]; then
++				SMB_SEC=$(uci add ksmbd share)
++				name=${path##*/}
++				uci set ksmbd.$SMB_SEC.name="$name"
++				uci set ksmbd.$SMB_SEC.path="$path"
++				uci set ksmbd.$SMB_SEC.browseable=yes
++				uci set ksmbd.$SMB_SEC.create_mask=0666
++				uci set ksmbd.$SMB_SEC.dir_mask=0777
++				uci set ksmbd.$SMB_SEC.force_create_mode=0666
++				uci set ksmbd.$SMB_SEC.force_directory_mode=0777
++			fi
++			if [ "$smb" = guest ]; then
++				uci set ksmbd.$SMB_SEC.guest_ok=yes
++				uci -q delete ksmbd.$SMB_SEC.users
++			else
++				uci set ksmbd.$SMB_SEC.guest_ok=no
++				uci set ksmbd.$SMB_SEC.users="$smb_users"
++			fi
++			uci set ksmbd.$SMB_SEC.read_only="$( [ "$smb_ro" = 1 ] && echo yes || echo no )"
++			;;
++		esac
++		uci commit ksmbd
++		service_on ksmbd
++	fi
++
++	# anonymous FTP (one folder, read-only)
++	if [ -x /etc/init.d/vsftpd ]; then
++		vsftpd_base
++		if [ "$ftp_anon" = 1 ]; then
++			conf_set anonymous_enable YES
++			conf_set anon_root "$path"
++			grep -q -x anonymous $FTP_USERS || echo anonymous >> $FTP_USERS
++			grep -q -x ftp $FTP_USERS || echo ftp >> $FTP_USERS
++		elif [ "$(conf_get anon_root)" = "$path" ]; then
++			conf_set anonymous_enable NO
++			sed -i '/^anon_root=/d' $VSFTPD_CONF
++			sed -i -E '/^(anonymous|ftp)$/d' $FTP_USERS
++		fi
++		vsftpd_apply
++	fi
++
++	# NFS
++	if [ -x /etc/init.d/nfsd ]; then
++		touch /etc/exports
++		awk -v p="$path" '$1 != p' /etc/exports > /etc/exports.new
++		if [ "$nfs" = 1 ]; then
++			echo "$nfs_clients" | grep -q -E '^[][A-Za-z0-9.:/*_ -]+$' ||
++				{ rm -f /etc/exports.new; reply_error "NFS clients: addresses, networks (a.b.c.d/nn), host names or *"; }
++			opt="$( [ "$nfs_ro" = 1 ] && echo ro || echo rw ),sync,no_subtree_check,insecure,all_squash,anonuid=65534,anongid=65534"
++			# FAT, exFAT and NTFS have no stable inode numbers to derive one from
++			opt="$opt,fsid=$(printf %d 0x$(echo "$path" | md5sum | cut -c1-7))"
++			line=$path
++			for c in $nfs_clients; do line="$line $c($opt)"; done
++			echo "$line" >> /etc/exports.new
++		fi
++		mv /etc/exports.new /etc/exports
++		if grep -q '^/' /etc/exports; then
++			service_on nfsd
++		else
++			service_off nfsd
++		fi
++	fi
++
++	json_init
++	json_add_boolean ok 1
++	json_dump
++}
++
++# --- users ----------------------------------------------------------------
++
++next_uid() {
++	local uid=1000
++	while cut -d: -f3 /etc/passwd | grep -q -x $uid; do uid=$((uid + 1)); done
++	echo $uid
++}
++
++account_ensure() {	# account_ensure <name>: system account without a shell
++	local shell uid
++	if user_exists "$1"; then
++		shell=$(awk -F: -v n="$1" '$1 == n { print $7 }' /etc/passwd)
++		uid=$(awk -F: -v n="$1" '$1 == n { print $3 }' /etc/passwd)
++		[ "$shell" = /bin/false ] && { [ "$uid" -ge 1000 ] ||
++			in_list "$1" "$(smb_users) $(ftp_users)"; } ||
++			reply_error "$1 is a system account, choose another name"
++		return
++	fi
++	user_add "$1" "$(next_uid)" 100 "$1" /mnt /bin/false
++	sed -i "s/^$1:x:/$1:*:/" /etc/shadow
++}
++
++account_drop() {	# account_drop <name>: remove an account this page made
++	local uid
++	uid=$(awk -F: -v n="$1" '$1 == n { print $3 }' /etc/passwd)
++	[ -n "$uid" ] && [ "$uid" -ge 1000 ] || return
++	lock /var/lock/passwd
++	sed -i "/^$1:/d" /etc/passwd /etc/shadow
++	lock -u /var/lock/passwd
++}
++
++account_home() {	# account_home <name> <dir>
++	awk -F: -v OFS=: -v n="$1" -v h="$2" '$1 == n { $6 = h } { print }' \
++		/etc/passwd > /etc/passwd.new && cat /etc/passwd.new > /etc/passwd
++	rm -f /etc/passwd.new
++}
++
++smb_drop_user() {	# remove a user from the "users" lists of the shares
++	local users u keep
++	config_get users "$1" users
++	in_list "$DROP" "$(echo $users | tr ',' ' ')" || return
++	keep=
++	for u in $(echo $users | tr ',' ' '); do
++		[ "$u" = "$DROP" ] || keep="$keep${keep:+ }$u"
++	done
++	if [ -n "$keep" ]; then
++		uci set ksmbd."$1".users="$keep"
++	else
++		# nobody left: keep the share closed rather than opening it to guests
++		uci set ksmbd."$1".users="$DROP"
++		SMB_ORPHAN=1
++	fi
++}
++
++do_set_user() {
++	local service action name password root write conf
++
++	json_get_vars service action name password root write
++	echo "$name" | grep -q -E '^[a-z_][a-z0-9_-]{0,31}$' ||
++		reply_error "user name: up to 32 small letters, digits, - or _, not starting with a digit or -"
++	in_list "$name" "$NOT_USERS" && reply_error "$name is reserved"
++	case "$action" in
++	add|set)
++		[ "$action" = add ] || [ -n "$password" ] || [ "$service" = ftp ] ||
++			reply_error "enter a password"
++		if [ -n "$password" ] || [ "$action" = add ]; then
++			[ ${#password} -ge 4 ] || reply_error "the password needs at least 4 characters"
++			case "$password" in *"
++"*) reply_error "the password cannot contain a line break" ;; esac
++		fi
++		;;
++	delete) ;;
++	*) reply_error "invalid action" ;;
++	esac
++
++	case "$service" in
++	smb)
++		[ -x /usr/sbin/ksmbd.adduser ] || reply_error "ksmbd is not installed"
++		conf=/etc/ksmbd/ksmbd.conf
++		[ -e $conf ] || conf=/etc/ksmbd/ksmbd.conf.template
++		case "$action" in
++		add|set)
++			[ "$action" = add ] && in_list "$name" "$(smb_users)" &&
++				reply_error "SMB user $name exists already"
++			[ "$action" = set ] && ! in_list "$name" "$(smb_users)" &&
++				reply_error "no SMB user $name"
++			account_ensure "$name"
++			printf '%s\n%s\n' "$password" "$password" |
++				ksmbd.adduser -C $conf "$name" >/dev/null 2>&1 ||
++				reply_error "ksmbd.adduser failed"
++			;;
++		delete)
++			ksmbd.adduser -C $conf -d "$name" >/dev/null 2>&1
++			DROP=$name SMB_ORPHAN=
++			config_load ksmbd
++			config_foreach smb_drop_user share
++			uci commit ksmbd
++			/etc/init.d/ksmbd running && /etc/init.d/ksmbd restart >/dev/null 2>&1
++			in_list "$name" "$(ftp_users)" || account_drop "$name"
++			;;
++		esac
++		;;
++	ftp)
++		[ -x /etc/init.d/vsftpd ] || reply_error "vsftpd is not installed"
++		vsftpd_base
++		case "$action" in
++		add|set)
++			[ "$action" = add ] && in_list "$name" "$(ftp_users)" &&
++				reply_error "FTP user $name exists already"
++			[ "$action" = set ] && ! in_list "$name" "$(ftp_users)" &&
++				reply_error "no FTP user $name"
++			root=${root:-/mnt}
++			[ "$root" = /mnt ] || is_folder "$root" ||
++				reply_error "$root is not a storage folder"
++			account_ensure "$name"
++			if [ -n "$password" ]; then
++				printf '%s\n%s\n' "$password" "$password" |
++					passwd "$name" >/dev/null 2>&1 || reply_error "passwd failed"
++			fi
++			account_home "$name" "$root"
++			printf 'local_root=%s\nwrite_enable=%s\n' "$root" \
++				"$( [ "$write" = 0 ] && echo NO || echo YES )" > $FTP_USERDIR/$name
++			grep -q -x "$name" $FTP_USERS || echo "$name" >> $FTP_USERS
++			;;
++		delete)
++			sed -i "/^$name\$/d" $FTP_USERS
++			rm -f $FTP_USERDIR/$name
++			if in_list "$name" "$(smb_users)"; then
++				user_exists "$name" && sed -i "s/^$name:[^:]*:/$name:*:/" /etc/shadow
++			else
++				account_drop "$name"
++			fi
++			;;
++		esac
++		vsftpd_apply
++		;;
++	*)
++		reply_error "invalid service"
++		;;
++	esac
++
++	json_init
++	json_add_boolean ok 1
++	[ -n "$SMB_ORPHAN" ] && json_add_string warning \
++		"a share had $name as its only user; it stays closed until you choose other users"
++	json_dump
++}
++
++case "$1" in
++list)
++	cat <<-EOF
++	{
++		"status": {},
++		"init": { "disk": "str", "label": "str", "fstype": "str" },
++		"shares": {},
++		"set_share": { "path": "str", "smb": "str", "smb_users": "str", "smb_ro": true,
++			"ftp_anon": true, "nfs": true, "nfs_clients": "str", "nfs_ro": true },
++		"set_user": { "service": "str", "action": "str", "name": "str",
++			"password": "str", "root": "str", "write": true }
++	}
++	EOF
++	;;
++call)
++	case "$2" in
++	status)
++		json_init
++		json_add_array disks
++		for d in /sys/block/sd*; do
++			[ -e "$d" ] && add_disk "${d##*/}"
++		done
++		json_close_array
++		json_add_array fstypes
++		for t in $(/usr/sbin/disk-init fstypes); do json_add_string "" "$t"; done
++		json_close_array
++		json_add_string state "$(cat $STATE 2>/dev/null)"
++		json_add_string log "$(tail -n 40 $LOG 2>/dev/null)"
++		json_dump
++		;;
++	init)
++		read -r input
++		json_load "$input"
++		json_get_vars disk label fstype
++		[ "$(cat $STATE 2>/dev/null)" = running ] &&
++			reply_error "an initialisation is already running"
++		case "$disk" in
++		sd[a-z]) ;;
++		*) reply_error "invalid disk" ;;
++		esac
++		echo "$label" | grep -q -E '^[A-Za-z0-9_-]{1,16}$' ||
++			reply_error "name: 1-16 letters, digits, - or _"
++		in_list "$fstype" "$(/usr/sbin/disk-init fstypes)" ||
++			reply_error "file system $fstype is not available"
++		echo running > $STATE
++		: > $LOG
++		( /usr/sbin/disk-init "$disk" "$label" "$fstype" >> $LOG 2>&1 \
++			&& echo done > $STATE || echo failed > $STATE ) \
++			</dev/null >/dev/null 2>&1 &
++		echo '{ "started": true }'
++		;;
++	shares)
++		do_shares
++		;;
++	set_share)
++		read -r input
++		json_load "$input"
++		do_set_share
++		;;
++	set_user)
++		read -r input
++		json_load "$input"
++		do_set_user
++		;;
++	esac
++	;;
++esac
+diff --git a/package/lacie/luci-app-disk-init/root/usr/sbin/disk-init b/package/lacie/luci-app-disk-init/root/usr/sbin/disk-init
+new file mode 100644
+index 0000000000..4bb1e63d68
+--- /dev/null
++++ b/package/lacie/luci-app-disk-init/root/usr/sbin/disk-init
+@@ -0,0 +1,197 @@
++#!/bin/sh
++# disk-init <disk> <name> <fstype>
++#
++# Erase <disk> (e.g. sda) and set it up for storage: one GPT partition with a
++# <fstype> file system labelled <name>, mounted at /mnt/<name> by UUID
++# (fstab). Shares (SMB, NFS, anonymous FTP) of the disk's old mount points
++# are removed; sharing the new folder is done afterwards on the Storage page.
++#
++# fstype: ext4 xfs btrfs f2fs exfat vfat ntfs (see "disk-init fstypes")
++
++GUID_LINUX=0FC63DAF-8483-4772-8E79-3D69D8477DE4
++GUID_MSDATA=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7
++
++# fstype  mkfs tool  kernel fs  label length
++FSTYPES='ext4 mkfs.ext4 ext4 16
++xfs mkfs.xfs xfs 12
++btrfs mkfs.btrfs btrfs 16
++f2fs mkfs.f2fs f2fs 16
++exfat mkfs.exfat exfat 15
++vfat mkfs.fat vfat 11
++ntfs mkntfs ntfs3 16'
++
++fs_supported() {	# fs_supported <kernel fs>
++	grep -q -w "$1" /proc/filesystems ||
++		[ -n "$(find /lib/modules/$(uname -r) -name "$1.ko" 2>/dev/null)" ]
++}
++
++if [ "$1" = fstypes ]; then
++	echo "$FSTYPES" | while read -r t tool kfs len; do
++		command -v $tool >/dev/null && fs_supported $kfs && echo $t
++	done
++	exit 0
++fi
++
++disk=$1
++label=$2
++fstype=${3:-ext4}
++dev=/dev/$disk
++part=${dev}1
++mnt=/mnt/$label
++
++say() { echo "$(date +%T) $*"; }
++fail() { say "ERROR: $*"; exit 1; }
++
++case "$disk" in sd[a-z]) ;; *) fail "invalid disk '$disk'" ;; esac
++echo "$label" | grep -q -E '^[A-Za-z0-9_-]{1,16}$' || fail "invalid name '$label'"
++set -- $(echo "$FSTYPES" | grep "^$fstype ")
++[ -n "$1" ] || fail "unknown file system '$fstype'"
++tool=$2 kfs=$3 len=$4
++command -v $tool >/dev/null || fail "$tool is not installed"
++fs_supported $kfs || fail "the kernel has no $kfs support"
++[ -b "$dev" ] || fail "$dev not found"
++grep -q -E "^$dev[0-9]* /(overlay|rom)? " /proc/mounts &&
++	fail "$dev holds the root or overlay file system"
++grep -q " $mnt " /proc/mounts && ! grep -q "^$dev[0-9]* $mnt " /proc/mounts &&
++	fail "$mnt is used by another disk, choose another name"
++
++. /lib/functions.sh
++
++old_uuids=
++for p in $(ls -d /sys/block/$disk/${disk}* 2>/dev/null); do
++	u=$(block info /dev/${p##*/} 2>/dev/null | sed -n 's/.* UUID="\([^"]*\)".*/\1/p')
++	[ -n "$u" ] && old_uuids="$old_uuids $u"
++done
++old_mounts=$(awk -v d="$dev" 'index($1, d) == 1 { print $2 }' /proc/mounts)
++
++say "Stopping the file sharing services"
++restart=
++for s in ksmbd vsftpd nfsd; do
++	[ -x /etc/init.d/$s ] && /etc/init.d/$s running 2>/dev/null || continue
++	/etc/init.d/$s stop
++	restart="$restart $s"
++done
++
++for p in $(awk -v d="$dev" 'index($1, d) == 1 { print $1 }' /proc/swaps); do
++	say "Turning off swap on $p"
++	swapoff "$p" || fail "cannot turn off swap on $p"
++done
++for m in $old_mounts; do
++	say "Unmounting $m"
++	umount "$m" || fail "$m is busy, stop what uses it and try again"
++done
++
++under() {	# under <path>: is <path> one of the old mount points or inside one?
++	local m
++	for m in $old_mounts $mnt; do
++		case "$1" in "$m"|"$m"/*) return 0 ;; esac
++	done
++	return 1
++}
++
++# fstab entries that point at the old partitions
++drop_mount() {
++	local uuid device target u
++	config_get uuid "$1" uuid
++	config_get device "$1" device
++	config_get target "$1" target
++	for u in $old_uuids; do
++		[ "$uuid" = "$u" ] && { uci delete fstab."$1"; return; }
++	done
++	case "$device" in $dev*) uci delete fstab."$1"; return ;; esac
++	[ -n "$target" ] && under "$target" && uci delete fstab."$1"
++}
++config_load fstab
++config_foreach drop_mount mount
++
++# SMB shares
++drop_share() {
++	local path
++	config_get path "$1" path
++	under "$path" && uci delete ksmbd."$1"
++}
++if [ -e /etc/config/ksmbd ]; then
++	config_load ksmbd
++	config_foreach drop_share share
++	uci commit ksmbd
++fi
++
++# NFS exports
++if [ -e /etc/exports ]; then
++	while read -r path rest; do
++		under "$path" && say "Removing NFS export $path"
++	done < /etc/exports
++	awk -v list="$old_mounts $mnt" '
++		BEGIN { n = split(list, m, " ") }
++		{ for (i = 1; i <= n; i++)
++			if ($1 == m[i] || index($1, m[i] "/") == 1) next
++		  print }' /etc/exports > /etc/exports.new && mv /etc/exports.new /etc/exports
++fi
++
++# anonymous FTP folder
++if [ -e /etc/vsftpd.conf ]; then
++	anon=$(sed -n 's/^anon_root=//p' /etc/vsftpd.conf)
++	if [ -n "$anon" ] && under "$anon"; then
++		say "Turning off anonymous FTP"
++		sed -i -e 's/^anonymous_enable=.*/anonymous_enable=NO/' -e '/^anon_root=/d' /etc/vsftpd.conf
++	fi
++fi
++
++case "$fstype" in exfat|vfat|ntfs) guid=$GUID_MSDATA ;; *) guid=$GUID_LINUX ;; esac
++say "Writing a new GPT partition table to $dev"
++printf 'label: gpt\n,,%s\n' $guid |
++	sfdisk -q --wipe always --wipe-partitions always "$dev" >/dev/null ||
++	fail "sfdisk failed"
++sleep 2
++i=0
++while [ ! -b "$part" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done
++[ -b "$part" ] || fail "$part did not appear"
++
++fslabel=$(echo "$label" | cut -c1-$len)
++options=
++say "Formatting $part as $fstype (label $fslabel), this can take a few minutes"
++case "$fstype" in
++ext4)	mkfs.ext4 -F -q -L "$fslabel" -m 1 "$part" ;;
++xfs)	mkfs.xfs -f -q -L "$fslabel" "$part" ;;
++btrfs)	mkfs.btrfs -f -q -L "$fslabel" "$part" >/dev/null ;;
++f2fs)	mkfs.f2fs -f -q -l "$fslabel" "$part" ;;
++exfat)	mkfs.exfat -L "$fslabel" "$part" >/dev/null; options=umask=0000 ;;
++vfat)	fslabel=$(echo "$fslabel" | tr a-z A-Z)
++	mkfs.fat -F 32 -n "$fslabel" "$part" >/dev/null
++	options=umask=0000,utf8 ;;
++ntfs)	mkntfs -f -q -L "$fslabel" "$part"; options=umask=0000 ;;
++esac || fail "formatting failed"
++
++i=0
++uuid=
++while [ -z "$uuid" ] && [ $i -lt 10 ]; do
++	uuid=$(block info "$part" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p')
++	[ -n "$uuid" ] || { sleep 1; i=$((i + 1)); }
++done
++[ -n "$uuid" ] || fail "no UUID on $part"
++
++say "Mounting at $mnt (UUID $uuid)"
++s=$(uci add fstab mount)
++uci set fstab.$s.uuid="$uuid"
++uci set fstab.$s.target="$mnt"
++[ -n "$options" ] && uci set fstab.$s.options="$options"
++uci set fstab.$s.enabled=1
++uci commit fstab || fail "cannot save fstab"
++mkdir -p "$mnt"
++block mount
++grep -q " $mnt " /proc/mounts || fail "$mnt is not mounted"
++chmod 0777 "$mnt" 2>/dev/null
++
++# FTP users whose folder is gone go back to all disks
++for f in /etc/vsftpd/users/*; do
++	[ -f "$f" ] || continue
++	r=$(sed -n 's/^local_root=//p' "$f")
++	[ -z "$r" ] || [ -d "$r" ] || sed -i 's,^local_root=.*,local_root=/mnt,' "$f"
++done
++
++for s in $restart; do
++	/etc/init.d/$s start
++done
++
++say "Done: $part ($fstype, $fslabel) mounted at $mnt"
++say "Share it under Shared folders below."
+diff --git a/package/lacie/luci-app-disk-init/root/usr/share/luci/menu.d/luci-app-disk-init.json b/package/lacie/luci-app-disk-init/root/usr/share/luci/menu.d/luci-app-disk-init.json
+new file mode 100644
+index 0000000000..e1d4b4e002
+--- /dev/null
++++ b/package/lacie/luci-app-disk-init/root/usr/share/luci/menu.d/luci-app-disk-init.json
+@@ -0,0 +1,13 @@
++{
++	"admin/system/disk-init": {
++		"title": "Storage",
++		"order": 45,
++		"action": {
++			"type": "view",
++			"path": "system/disk-init"
++		},
++		"depends": {
++			"acl": [ "luci-app-disk-init" ]
++		}
++	}
++}
+diff --git a/package/lacie/luci-app-disk-init/root/usr/share/rpcd/acl.d/luci-app-disk-init.json b/package/lacie/luci-app-disk-init/root/usr/share/rpcd/acl.d/luci-app-disk-init.json
+new file mode 100644
+index 0000000000..03f384e1a9
+--- /dev/null
++++ b/package/lacie/luci-app-disk-init/root/usr/share/rpcd/acl.d/luci-app-disk-init.json
+@@ -0,0 +1,15 @@
++{
++	"luci-app-disk-init": {
++		"description": "Grant access to the Storage page (format disks, sharing, SMB and FTP users)",
++		"read": {
++			"ubus": {
++				"disk-init": [ "status", "shares" ]
++			}
++		},
++		"write": {
++			"ubus": {
++				"disk-init": [ "init", "set_share", "set_user" ]
++			}
++		}
++	}
++}
 diff --git a/target/linux/kirkwood/Makefile b/target/linux/kirkwood/Makefile
 index 7216c573b0..abfa8e8ebe 100644
 --- a/target/linux/kirkwood/Makefile
@@ -163,24 +1500,35 @@ index 0000000000..0a250cb5fe
 +}
 diff --git a/target/linux/kirkwood/base-files/etc/init.d/ws-led b/target/linux/kirkwood/base-files/etc/init.d/ws-led
 new file mode 100755
-index 0000000000..44b6609ca6
+index 0000000000..66095ee7d8
 --- /dev/null
 +++ b/target/linux/kirkwood/base-files/etc/init.d/ws-led
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,27 @@
 +#!/bin/sh /etc/rc.common
 +
 +START=99
 +STOP=01
++USE_PROCD=1
 +
 +ws() {
 +	[ "$(cat /tmp/sysinfo/board_name 2>/dev/null)" = "lacie,wireless-space" ]
 +}
 +
-+start() {
++start_service() {
 +	ws && /usr/sbin/ws-led ready
 +}
 +
-+stop() {
++# LED entries changed in /etc/config/system (System > LED Configuration);
++# its own trigger, as ucitrack runs only one script per config change
++reload_service() {
++	start_service
++}
++
++service_triggers() {
++	procd_add_reload_trigger system
++}
++
++stop_service() {
 +	ws && /usr/sbin/ws-led shutdown
 +}
 diff --git a/target/linux/kirkwood/base-files/etc/rc.wps/10-ws-led b/target/linux/kirkwood/base-files/etc/rc.wps/10-ws-led
@@ -372,10 +1720,10 @@ index 0000000000..73d035ba3b
 +done
 diff --git a/target/linux/kirkwood/base-files/usr/sbin/ws-led b/target/linux/kirkwood/base-files/usr/sbin/ws-led
 new file mode 100755
-index 0000000000..7e91810499
+index 0000000000..b5cd788778
 --- /dev/null
 +++ b/target/linux/kirkwood/base-files/usr/sbin/ws-led
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,108 @@
 +#!/bin/sh
 +# LaCie Wireless Space front light, as in the stock manual (1.8 Light Behavior):
 +#
@@ -393,11 +1741,21 @@ index 0000000000..7e91810499
 +#
 +# Boot (blue fast blinking) and failsafe (red blinking) come from the
 +# led-boot/led-failsafe aliases in the DTS through /etc/diag.sh.
++#
++# A colour that has its own LED entry in /etc/config/system (System > LED
++# Configuration in LuCI) is left to that entry, except for shutdown and
++# upgrade; deleting the entry gives it back to this scheme.
 +
 +L=/sys/class/leds
 +
++case "$1" in
++shutdown|upgrade) USER_LEDS= ;;
++*) USER_LEDS=" $(uci -q show system | sed -n "s/^system\..*\.sysfs='\(.*\)'$/\1/p" | tr '\n' ' ')" ;;
++esac
++
 +led() {	# led <name> <trigger> [brightness]
 +	[ -d "$L/$1" ] || return 0
++	case "$USER_LEDS" in *" $1 "*) return 0 ;; esac
 +	echo "$2" > "$L/$1/trigger"
 +	[ -n "$3" ] && echo "$3" > "$L/$1/brightness"
 +}
@@ -447,6 +1805,7 @@ index 0000000000..7e91810499
 +	t=300
 +	[ "$1" = touch ] && t=70
 +	for l in blue:status green:status; do
++		case "$USER_LEDS" in *" $l "*) continue ;; esac
 +		led $l timer
 +		echo $t > $L/$l/delay_on
 +		echo $t > $L/$l/delay_off
@@ -867,7 +2226,7 @@ index 0000000000..4c3c3ee735
 +	};
 +};
 diff --git a/target/linux/kirkwood/image/Makefile b/target/linux/kirkwood/image/Makefile
-index 0012281334..edcdd4c232 100644
+index 0012281334..ad03030000 100644
 --- a/target/linux/kirkwood/image/Makefile
 +++ b/target/linux/kirkwood/image/Makefile
 @@ -128,6 +128,10 @@ define Device/Default
@@ -881,7 +2240,7 @@ index 0012281334..edcdd4c232 100644
  define Device/checkpoint_l-50
    DEVICE_VENDOR := Check Point
    DEVICE_MODEL := L-50
-@@ -283,6 +287,17 @@ define Device/iptime_nas1
+@@ -283,6 +287,22 @@ define Device/iptime_nas1
  endef
  TARGET_DEVICES += iptime_nas1
  
@@ -892,14 +2251,19 @@ index 0012281334..edcdd4c232 100644
 +  DEVICE_PACKAGES := kmod-ata-marvell-sata kmod-fs-ext4 kmod-dsa-mv88e6xxx \
 +	kmod-gpio-button-hotplug kmod-rtc-mv kmod-hwmon-drivetemp kmod-hwmon-gpiofan \
 +	kmod-usb-storage block-mount e2fsprogs kmod-eeprom-at24 \
-+	kmod-ath9k kmod-rt2800-pci wpad-mbedtls
++	kmod-ath9k kmod-rt2800-pci wpad-mbedtls luci-app-disk-init \
++	kmod-fs-xfs xfs-mkfs kmod-fs-btrfs btrfs-progs kmod-fs-f2fs mkf2fs \
++	kmod-fs-exfat exfat-mkfs kmod-fs-vfat dosfstools kmod-fs-ntfs3 ntfs-3g-utils \
++	kmod-nls-cp437 kmod-nls-iso8859-1 kmod-nls-utf8 vsftpd nfs-kernel-server \
++	kmod-ledtrig-activity kmod-ledtrig-pattern kmod-ledtrig-oneshot \
++	kmod-ledtrig-transient kmod-usb-ledtrig-usbport
 +endef
 +TARGET_DEVICES += lacie_wireless-space
 +
  define Device/linksys
    $(Device/kernel-size-migration-linksys)
    DEVICE_VENDOR := Linksys
-@@ -413,4 +428,6 @@ define Device/zyxel_nsa325
+@@ -413,4 +433,6 @@ define Device/zyxel_nsa325
  endef
  TARGET_DEVICES += zyxel_nsa325
  

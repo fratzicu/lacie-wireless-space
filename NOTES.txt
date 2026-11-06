@@ -37,7 +37,7 @@ STATUS on 2026-10-30
   as in the stock manual, full wpad with WPS, WPS touch button
   (sysupgrade sha256 cd094e43...).
 - FLASHED AGAIN 2026-11-01 ~21:05 (sysupgrade -v, config kept): touch
-  feedback (sysupgrade sha256 da964549...). Images here = that build.
+  feedback (sysupgrade sha256 da964549...).
   Source: github.com/fratzicu/openwrt-upstream branch lacie-wireless-space,
   github.com/fratzicu/u-boot branch wireless-space.
   Flashing and recovery how-to: FLASHING.txt.
@@ -84,6 +84,51 @@ STATUS on 2026-10-30
     Tested 2026-11-01 with the case open (touching the pad directly);
     through the closed front cover still to be checked after a
     power-cycle with the cover on.
+
+- FLASHED AGAIN 2026-11-02 (sysupgrade -v, config kept): Storage page
+  v2 (sysupgrade sha256 7e10b21a...), then 2026-11-06 ~19:10 a test build
+  (3ae3d207...) and 2026-11-06 20:58 the LED configuration fix
+  (sysupgrade sha256 ff2ad5ed...). Images here = that build. Checked after
+  the upgrade: settings kept, ws-led runs as a
+  procd service with a reload trigger on "system", light blue steady.
+  * Storage page, LuCI System > Storage (package/lacie/luci-app-disk-init,
+    rpcd object "disk-init", /usr/sbin/disk-init):
+      Disks           Initialize... = GPT (sfdisk), one partition, file
+                      system of choice (only those with mkfs tool + kernel
+                      support: ext4 xfs btrfs f2fs exfat vfat ntfs), fstab
+                      mount by UUID at /mnt/<name> (exfat/vfat/ntfs with
+                      umask=0000). Removes the old fstab/SMB/NFS/anonymous
+                      FTP entries of that disk. Runs in the background, log
+                      in /tmp/disk-init.log.
+      Shared folders  per mounted disk: SMB (off / everyone / chosen SMB
+                      users, read-only), anonymous read-only FTP (one
+                      folder), NFS (clients, default the LAN subnet,
+                      read-only; all_squash to nobody, fsid set)
+      SMB users       ksmbd.adduser -> /etc/ksmbd/ksmbdpwd.db + system
+                      account without shell (uid >= 1000, group users)
+      FTP users       separate list and password (/etc/shadow via passwd),
+                      /etc/vsftpd/vsftpd.users (userlist, deny=NO), folder
+                      and write access in /etc/vsftpd/users/<name>
+                      (local_root, chroot_local_user), root cannot log in
+    Stored only in the services' own files (/etc/config/ksmbd,
+    /etc/vsftpd.conf, /etc/vsftpd/, /etc/exports, /etc/passwd+shadow), all
+    kept on sysupgrade. Services > Network Shares shows the same shares.
+    Read-only methods tested on the box; Initialize, sharing changes and
+    users not run yet (Initialize erases the disk).
+    nfsd (package default) starts at boot even without exports.
+  * LED configuration: System > LED Configuration (stock LuCI) works for
+    red:status, green:status, blue:status (red:fault = hardware blink).
+    A colour with its own entry follows that entry; ws-led leaves it
+    alone except at shutdown/upgrade; deleting the entry gives it back to
+    the default scheme (tested 2026-11-06: blue heartbeat while green kept
+    ata1, then back to default-on). Triggers: ata1, phy0rx/tx/tpt/assoc/
+    radio, netdev, timer, heartbeat, default-on, activity, pattern,
+    oneshot, transient, usbport. ws-led is a procd service with its own
+    reload trigger: two non-procd scripts on the same config in ucitrack
+    make procd run only one (the led reload was dropped).
+  * Switch: DSA, so no Network > Switch page (that one is for swconfig);
+    per-port VLANs in Network > Interfaces > Devices > br-lan > Bridge
+    VLAN filtering. The port LEDs are PHY registers, not /sys/class/leds.
 
 FILES
   openwrt-...-squashfs-sysupgrade.bin   final image (sysupgrade from OpenWrt)
@@ -198,4 +243,6 @@ FLASH / RECOVER
    (mtd0 + mtd1 here, mtd2 from the full backup), page-exact with OOB.
 
 OPEN POINTS
+- Storage page: Initialize, sharing and users still to be tested on a
+  disk that may be erased.
 - WPS touch through the closed front cover: to be tested.
